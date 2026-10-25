@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import argparse
 import html as html_mod
 import json
 import logging
 import math
+import os
 import re
 import threading
 import unicodedata
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -26,7 +29,6 @@ from rich.table import Table
 from rich.prompt import Prompt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# 仅对网络/超时类异常重试，避免对 404/参数错误/认证失败等无意义异常反复重试
 _RETRYABLE_EXC: list[type[BaseException]] = [OSError, TimeoutError]
 try:
     from jmcomic.exception_all import JmNetworkException as _JmNetExc  # type: ignore
@@ -62,11 +64,31 @@ DEFAULT_LANGUAGE_TAGS: set[str] = {
     "Chinese", "Japanese", "English", "CG",
 }
 
-# 标签型标记：单方括号/圆括号/中文方括号，一种或多种
 _TAG_PATTERN = r"(?:\[[^\]]*\]|\([^)]*\)|【[^】]*】)"
 _TAG_ONE_RE = re.compile(_TAG_PATTERN)
 _TAG_PREFIX_RE = re.compile(rf"^(?:{_TAG_PATTERN}\s*)+")
 _TAG_SUFFIX_RE = re.compile(rf"\s*(?:{_TAG_PATTERN})+$")
+
+# ==================== 标题工具（纯函数 + LRU 缓存） ====================
+@lru_cache(maxsize=8192)
+def _split_title_cached(norm_title: str) -> tuple[str, str]:
+    """输入已 normalize 的标题，返回 (base, suffix_key)。纯函数，可缓存。"""
+    s = _TAG_PREFIX_RE.sub("", norm_title)
+
+    suffixes: list[str] = []
+    while True:
+        m = _TAG_SUFFIX_RE.search(s)
+        if not m:
+            break
+        for tag in _TAG_ONE_RE.findall(m.group(0)):
+            suffixes.append(re.sub(r"\s+", "", tag).lower())
+        new_s = s[: m.start()].rstrip()
+        if new_s == s:
+            break
+        s = new_s
+
+    base = re.sub(r"\s+", "", s).lower()
+    return base, "|".join(sorted(suffixes))
 
 
 # ==================== 配置 ====================
@@ -82,6 +104,9 @@ class SearchConfig:
     exclude_language_tags: bool = True
     extra_language_tags: list[str] = field(default_factory=list)
     blacklist_tags: list[str] = field(default_factory=list)
+    blacklist_penalty: float = 2.0
+    enrich_candidates: bool = True
+    enrich_extra: int = 50
 
 
 @dataclass
@@ -99,6 +124,7 @@ class FeedbackConfig:
 @dataclass
 class ConcurrencyConfig:
     max_workers: int = 8
+    # 注意：rate_limit 实际是"并发上限"（Semaphore），并非 QPS 限速。
     rate_limit: int = 4
     cache_size: int = 256
 
@@ -132,7 +158,12 @@ max_pages = 1
 author_weight = 0.5
 exclude_language_tags = true
 extra_language_tags = []
+
+# 黑名单：不再硬过滤，而是对命中条目降权（软惩罚）
 blacklist_tags = []
+blacklist_penalty = 2.0
+enrich_candidates = true
+enrich_extra = 50
 
 [export]
 format = ""          # "" / "md" / "html"
@@ -156,44 +187,114 @@ def _write_default_config(path: Path) -> None:
     path.write_text(_DEFAULT_CONFIG_TEXT, encoding="utf-8")
 
 
+# ---- 配置容错辅助 ----
+def _safe_int(d: dict, k: str, default: int) -> int:
+    v = d.get(k, default)
+    if isinstance(v, bool):  # 防止 True 被当成 1
+        log.warning("配置项 %s=%r 类型非法，使用默认 %r", k, v, default)
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        log.warning("配置项 %s=%r 非法，使用默认 %r", k, v, default)
+        return default
+
+
+def _safe_float(d: dict, k: str, default: float) -> float:
+    v = d.get(k, default)
+    if isinstance(v, bool):
+        log.warning("配置项 %s=%r 类型非法，使用默认 %r", k, v, default)
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        log.warning("配置项 %s=%r 非法，使用默认 %r", k, v, default)
+        return default
+
+
+def _safe_bool(d: dict, k: str, default: bool) -> bool:
+    v = d.get(k, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        lv = v.strip().lower()
+        if lv in ("true", "1", "yes", "on"):
+            return True
+        if lv in ("false", "0", "no", "off"):
+            return False
+    log.warning("配置项 %s=%r 非法，使用默认 %r", k, v, default)
+    return default
+
+
+def _safe_str(d: dict, k: str, default: str) -> str:
+    v = d.get(k, default)
+    if isinstance(v, str):
+        return v
+    log.warning("配置项 %s=%r 应为字符串，使用默认 %r", k, v, default)
+    return default
+
+
+def _safe_str_list(d: dict, k: str) -> list[str]:
+    v = d.get(k, [])
+    if not isinstance(v, list):
+        log.warning("配置项 %s=%r 应为列表，已忽略", k, v)
+        return []
+    return [str(x) for x in v]
+
+
 def _load_config(path: Path) -> AppConfig:
     if not path.exists():
         log.warning("⚠️ 未找到 %s，已写入默认配置", path)
         _write_default_config(path)
-    with path.open("rb") as f:
-        data = tomllib.load(f)
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        log.error("❌ config.toml 解析失败: %s，使用默认配置", e)
+        return AppConfig()
+    except OSError as e:
+        log.error("❌ 读取 config.toml 失败: %s，使用默认配置", e)
+        return AppConfig()
 
     s = data.get("search", {})
     e = data.get("export", {})
     fb = data.get("feedback", {})
     cc = data.get("concurrency", {})
     st = data.get("storage", {})
+    if not isinstance(s, dict):  s = {}
+    if not isinstance(e, dict):  e = {}
+    if not isinstance(fb, dict): fb = {}
+    if not isinstance(cc, dict): cc = {}
+    if not isinstance(st, dict): st = {}
 
     return AppConfig(
         search=SearchConfig(
-            mode=str(s.get("mode", "ranked")),
-            top_tags=int(s.get("top_tags", 15)),
-            top_authors=int(s.get("top_authors", 10)),
-            top_n=int(s.get("top_n", 100)),
-            idf_power=float(s.get("idf_power", 1.0)),
-            max_pages=int(s.get("max_pages", 1)),
-            author_weight=float(s.get("author_weight", 0.5)),
-            exclude_language_tags=bool(s.get("exclude_language_tags", True)),
-            extra_language_tags=[str(x) for x in s.get("extra_language_tags", [])],
-            blacklist_tags=[str(x) for x in s.get("blacklist_tags", [])],
+            mode=_safe_str(s, "mode", "ranked"),
+            top_tags=_safe_int(s, "top_tags", 15),
+            top_authors=_safe_int(s, "top_authors", 10),
+            top_n=_safe_int(s, "top_n", 100),
+            idf_power=_safe_float(s, "idf_power", 1.0),
+            max_pages=_safe_int(s, "max_pages", 1),
+            author_weight=_safe_float(s, "author_weight", 0.5),
+            exclude_language_tags=_safe_bool(s, "exclude_language_tags", True),
+            extra_language_tags=_safe_str_list(s, "extra_language_tags"),
+            blacklist_tags=_safe_str_list(s, "blacklist_tags"),
+            blacklist_penalty=_safe_float(s, "blacklist_penalty", 2.0),
+            enrich_candidates=_safe_bool(s, "enrich_candidates", True),
+            enrich_extra=_safe_int(s, "enrich_extra", 50),
         ),
-        export=ExportConfig(format=str(e.get("format", ""))),
+        export=ExportConfig(format=_safe_str(e, "format", "")),
         feedback=FeedbackConfig(
-            enabled=bool(fb.get("enabled", True)),
-            selected_bonus=float(fb.get("selected_bonus", 0.5)),
-            skipped_penalty=float(fb.get("skipped_penalty", 0.2)),
+            enabled=_safe_bool(fb, "enabled", True),
+            selected_bonus=_safe_float(fb, "selected_bonus", 0.5),
+            skipped_penalty=_safe_float(fb, "skipped_penalty", 0.2),
         ),
         concurrency=ConcurrencyConfig(
-            max_workers=int(cc.get("max_workers", 8)),
-            rate_limit=int(cc.get("rate_limit", 4)),
-            cache_size=int(cc.get("cache_size", 256)),
+            max_workers=_safe_int(cc, "max_workers", 8),
+            rate_limit=_safe_int(cc, "rate_limit", 4),
+            cache_size=_safe_int(cc, "cache_size", 256),
         ),
-        storage=StorageConfig(memo_path=str(st.get("memo_path", "memo.toml"))),
+        storage=StorageConfig(memo_path=_safe_str(st, "memo_path", "memo.toml")),
     )
 
 
@@ -204,8 +305,8 @@ _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 def _toml_key(k: str) -> str:
     if _TOML_BARE_KEY_RE.match(k):
         return k
-    esc = k.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{esc}"'
+    # 用 JSON 字符串转义：\uXXXX / \n / \r / \t / \" / \\ 都是合法 TOML 基本字符串
+    return json.dumps(k, ensure_ascii=False)
 
 
 def _toml_value(v) -> str:
@@ -216,17 +317,46 @@ def _toml_value(v) -> str:
     if isinstance(v, float):
         return repr(v)
     if isinstance(v, str):
-        esc = (v.replace("\\", "\\\\").replace('"', '\\"')
-               .replace("\n", "\\n").replace("\t", "\\t"))
-        return f'"{esc}"'
+        return json.dumps(v, ensure_ascii=False)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     raise TypeError(f"不支持 TOML 类型: {type(v).__name__}")
 
 
 def _md_escape(s: str) -> str:
-    """Markdown 表格单元格转义：管道符与换行。"""
     return s.replace("|", "\\|").replace("\n", " ")
+
+
+# ---- memo 反序列化容错 ----
+def _as_counter(x) -> Counter[str]:
+    out: Counter[str] = Counter()
+    if isinstance(x, dict):
+        for k, v in x.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                log.warning("memo 中 %r 的计数 %r 非法，已忽略", k, v)
+    return out
+
+
+def _as_str_list(x) -> list[str]:
+    if isinstance(x, list):
+        return [str(i) for i in x]
+    return []
+
+
+def _as_str_set(x) -> set[str]:
+    return set(_as_str_list(x))
+
+
+def _as_title_versions(x) -> dict[str, set[str]]:
+    if not isinstance(x, dict):
+        return {}
+    out: dict[str, set[str]] = {}
+    for k, v in x.items():
+        if isinstance(v, list):
+            out[str(k)] = {str(s) for s in v}
+    return out
 
 
 # ==================== 主类 ====================
@@ -244,10 +374,10 @@ class ComicAdv:
         self.selected_tags: Counter[str] = Counter()
         self.skipped_tags: Counter[str] = Counter()
         self.added: set[str] = set()
-
-        # 主标题 -> 已收录版本（suffix_key 集合）；base 为空时忽略
         self.added_title_versions: dict[str, set[str]] = {}
         self.if_login: bool = False
+
+        self._eff_tags_cache: list[tuple[str, int]] | None = None
 
         if self.config.search.exclude_language_tags:
             self.language_tags: set[str] = (
@@ -260,6 +390,11 @@ class ComicAdv:
         self.blacklist_tags: set[str] = {
             t.strip() for t in self.config.search.blacklist_tags if t.strip()
         }
+        if self.blacklist_tags and not self.config.search.enrich_candidates:
+            log.warning(
+                "⚠️ 已配置黑名单但 enrich_candidates=false，"
+                "搜索结果不带 tags 时将无法计算黑名单惩罚"
+            )
 
         if self.option_path.exists():
             self.option: JmOption = create_option_by_file(str(self.option_path))
@@ -270,15 +405,21 @@ class ComicAdv:
 
         self._lock = threading.Lock()
         self._max_workers = self.config.concurrency.max_workers
-        self._semaphore = threading.Semaphore(self.config.concurrency.rate_limit)
+        # 拆成两个信号量，避免 meta 请求与 search 请求互相挤占
+        self._meta_semaphore = threading.Semaphore(self.config.concurrency.rate_limit)
+        self._search_semaphore = threading.Semaphore(self.config.concurrency.rate_limit)
         self._local = threading.local()
 
-        self._query_cache: dict[tuple[str, int], list] = {}
+        self._query_cache: OrderedDict[tuple[str, int], list] = OrderedDict()
         self._query_cache_lock = threading.Lock()
 
         self._username: str = ""
         self._password: str = ""
         self._login_generation: int = 0
+
+    # ---------- 内部缓存管理 ----------
+    def _invalidate_eff_tags(self) -> None:
+        self._eff_tags_cache = None
 
     # ---------- login ----------
     def login(self, username: str = "", password: str = "") -> bool:
@@ -296,13 +437,17 @@ class ComicAdv:
             if not result:
                 raise RuntimeError("login returned empty result")
         except Exception as e:
+            # 失败时清空凭据，避免后续每个线程反复用错误密码重试
+            with self._lock:
+                self._username = ""
+                self._password = ""
+                self._login_generation += 1
             self.if_login = False
             log.error("❌ 登录失败: %r", e)
             return False
 
         self._local.client = client
         self._local.generation = self._login_generation
-        # 登录后清空 query 缓存：匿名态可能缓存了空/老结果
         with self._query_cache_lock:
             self._query_cache.clear()
         self.if_login = True
@@ -335,7 +480,7 @@ class ComicAdv:
         reraise=True,
     )
     def _fetch_meta_safe(self, album_id: str) -> tuple[list[str], list[str], str]:
-        with self._semaphore:
+        with self._meta_semaphore:
             album: JmAlbumDetail = self._get_client().get_album_detail(album_id)
         tags = list(album.tags or [])
         authors = self._extract_authors(album)
@@ -352,35 +497,8 @@ class ComicAdv:
 
     @classmethod
     def _split_title(cls, title: str) -> tuple[str, str]:
-        """拆成 (base_key, suffix_key)。
-
-        - 前缀：所有连续 [..]/(..)/【..】 循环去除（含中间空白）。
-        - 后缀：所有连续 [..]/(..)/【..】 循环提取，作为版本标识。
-        - base_key = 去前后缀后的核心（去空白、小写）。
-        - suffix_key = 提取出的标记（去空白、小写）排序后以 | 连接；
-          无后缀时为 ""。
-        """
-        s = cls._norm_title(title)
-
-        # 前缀：去干净；加 max_iter 防极端输入下的死循环
-        for _ in range(16):
-            new_s = _TAG_PREFIX_RE.sub("", s)
-            if new_s == s:
-                break
-            s = new_s
-
-        suffixes: list[str] = []
-        for _ in range(16):
-            m = _TAG_SUFFIX_RE.search(s)
-            if not m:
-                break
-            for tag in _TAG_ONE_RE.findall(m.group(0)):
-                suffixes.append(re.sub(r"\s+", "", tag).lower())
-            s = s[: m.start()].rstrip()
-
-        base = re.sub(r"\s+", "", s).lower()
-        suffix_key = "|".join(sorted(suffixes))
-        return base, suffix_key
+        # 先 normalize，再走模块级 LRU 缓存
+        return _split_title_cached(cls._norm_title(title))
 
     def _is_title_dup(self, title: str) -> bool:
         base, suf = self._split_title(title)
@@ -389,7 +507,6 @@ class ComicAdv:
         return suf in self.added_title_versions.get(base, set())
 
     def _register_title(self, title: str) -> bool:
-        """登记标题；返回是否为重复。"""
         base, suf = self._split_title(title)
         if not base:
             return False
@@ -414,17 +531,26 @@ class ComicAdv:
         result: list[str] = []
         for raw in inpt:
             aid = raw.strip()
-            if aid and aid not in seen:
-                seen.add(aid)
-                result.append(aid)
+            if not aid:
+                continue
+            if not aid.isdigit():
+                log.warning("⚠️ 跳过非法 ID: %r（应为纯数字）", raw)
+                continue
+            if aid in seen:
+                continue
+            seen.add(aid)
+            result.append(aid)
         return result
 
     def _effective_fav_tags(self) -> list[tuple[str, int]]:
+        if self._eff_tags_cache is not None:
+            return self._eff_tags_cache
         eff = [
             (t, c) for t, c in self.fav_tag.most_common()
             if t not in self.language_tags
         ]
         eff.sort(key=lambda x: self._tag_weight(x[0]), reverse=True)
+        self._eff_tags_cache = eff
         return eff
 
     # ---------- 持久化 ----------
@@ -441,20 +567,29 @@ class ComicAdv:
         log.info("未找到 memo，从空开始")
 
     def _load_memo_toml(self) -> None:
-        with self.memo_path.open("rb") as f:
-            data = tomllib.load(f)
-        self.fav_tag = Counter(data.get("fav_tag", {}))
-        self.fav_author = Counter(data.get("fav_author", {}))
+        try:
+            with self.memo_path.open("rb") as f:
+                data = tomllib.load(f)
+        except (tomllib.TOMLDecodeError, OSError) as e:
+            log.error("❌ memo.toml 读取/解析失败: %s，从空开始", e)
+            return
+
+        self.fav_tag = _as_counter(data.get("fav_tag"))
+        self.fav_author = _as_counter(data.get("fav_author"))
+
         meta = data.get("meta", {})
-        self.added = set(meta.get("added", []))
-        tv = meta.get("title_versions", {})
-        self.added_title_versions = {
-            str(base): {str(s) for s in sufs}
-            for base, sufs in tv.items()
-        }
+        if not isinstance(meta, dict):
+            meta = {}
+        self.added = _as_str_set(meta.get("added"))
+        self.added_title_versions = _as_title_versions(meta.get("title_versions"))
+
         fb = data.get("feedback", {})
-        self.selected_tags = Counter(fb.get("selected_tags", {}))
-        self.skipped_tags = Counter(fb.get("skipped_tags", {}))
+        if not isinstance(fb, dict):
+            fb = {}
+        self.selected_tags = _as_counter(fb.get("selected_tags"))
+        self.skipped_tags = _as_counter(fb.get("skipped_tags"))
+
+        self._invalidate_eff_tags()
         n_versions = sum(len(v) for v in self.added_title_versions.values())
         log.info(
             "已加载 %d tags, %d authors, %d added, %d 主标题 / %d 版本, "
@@ -465,14 +600,18 @@ class ComicAdv:
         )
 
     def _migrate_from_json(self, path: Path) -> None:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.fav_tag = Counter(data.get("fav_tag", {}))
-        self.fav_author = Counter(data.get("fav_author", {}))
-        self.added = set(data.get("added", []))
-        old_titles = data.get("added_titles", [])
-        for t in old_titles:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log.error("❌ 读取 %s 失败: %s", path, e)
+            return
+        self.fav_tag = _as_counter(data.get("fav_tag"))
+        self.fav_author = _as_counter(data.get("fav_author"))
+        self.added = _as_str_set(data.get("added"))
+        for t in data.get("added_titles", []):
             self._register_title(t)
+        self._invalidate_eff_tags()
         log.info(
             "迁移完成：%d tags, %d authors, %d added, %d 主标题",
             len(self.fav_tag), len(self.fav_author),
@@ -561,6 +700,7 @@ class ComicAdv:
                     fail += 1
                     log.warning("❌ fetch %s failed: %r", aid, e)
 
+        self._invalidate_eff_tags()
         console.print(
             f"[bold green]抓取完成:[/] 成功 {success}, 失败 {fail}, "
             f"标题重复 {dup}"
@@ -571,24 +711,24 @@ class ComicAdv:
         self,
         tags: Iterable[str] = (),
         authors: Iterable[str] = (),
-        use_blacklist: bool = True,
     ) -> str:
+        """构建搜索 query。黑名单改为软惩罚，不发服务端。"""
         parts: list[str] = []
         for a in authors:
-            parts.append(AUTHOR_QUERY_TEMPLATE.format(author=a))
+            # 转义作者名中的引号和反斜杠，避免破坏 query 语法
+            a_esc = a.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(AUTHOR_QUERY_TEMPLATE.format(author=a_esc))
         for t in tags:
             parts.append(f"+{t}")
-        if use_blacklist:
-            for b in sorted(self.blacklist_tags):
-                parts.append(f"-{b}")
         return " ".join(parts)
 
     def _cached_search(self, query: str, page: int) -> list | None:
         key = (query, page)
         with self._query_cache_lock:
             if key in self._query_cache:
+                self._query_cache.move_to_end(key)  # LRU: 命中移到末尾
                 return self._query_cache[key]
-        with self._semaphore:
+        with self._search_semaphore:
             try:
                 page_obj = self._get_client().search_site(search_query=query, page=page)
                 batch = list(page_obj)
@@ -596,11 +736,10 @@ class ComicAdv:
                 log.warning("search %r (page=%d) failed: %r", query, page, e)
                 return None
         with self._query_cache_lock:
-            if len(self._query_cache) >= self.config.concurrency.cache_size:
-                drop = list(self._query_cache.keys())[: max(1, len(self._query_cache) // 2)]
-                for k in drop:
-                    del self._query_cache[k]
             self._query_cache[key] = batch
+            self._query_cache.move_to_end(key)
+            while len(self._query_cache) > self.config.concurrency.cache_size:
+                self._query_cache.popitem(last=False)
         return batch
 
     def _get_comic(
@@ -610,14 +749,13 @@ class ComicAdv:
         page: int = 1,
         exclude_added: bool = True,
         max_pages: int = 1,
-        use_blacklist: bool = True,
     ) -> tuple[list[dict], int]:
         tags_list = list(tags)
         authors_list = list(authors)
         if not tags_list and not authors_list:
             return [], 0
 
-        query = self._build_query(tags_list, authors_list, use_blacklist=use_blacklist)
+        query = self._build_query(tags_list, authors_list)
         raw_items: list = []
         fetched_pages = 0
         stop_reason = "未开始"
@@ -640,12 +778,11 @@ class ComicAdv:
         else:
             stop_reason = f"达到 max_pages={max_pages}"
 
-        log.info(
+        log.debug(
             "🔍 query=%r -> 共 %d 条（翻 %d 页，末页 %d 条，%s）",
             query, len(raw_items), fetched_pages, last_page_size, stop_reason,
         )
 
-        added_ids = set(self.added)
         items: list[dict] = []
         for item in raw_items:
             if hasattr(item, "album_id"):
@@ -658,17 +795,19 @@ class ComicAdv:
                     continue
                 sid = str(sid_raw)
                 title = str(title)
-            is_added = sid in added_ids or self._is_title_dup(title)
+            is_added = sid in self.added or self._is_title_dup(title)
             if exclude_added and is_added:
                 continue
             item_authors = (self._extract_authors(item)
                               if hasattr(item, "album_id") else [])
-            items.append({"id": sid, "title": title, "added": is_added,
-                          "authors": item_authors})
+            items.append({
+                "id": sid, "title": title, "added": is_added,
+                "authors": item_authors,
+            })
 
         return items, len(raw_items)
 
-    # ---------- 打分 / 反馈 ----------
+    # ---------- 打分 ----------
     def _tag_weight(self, tag: str) -> float:
         base = float(self.fav_tag.get(tag, 0))
         fb = self.config.feedback
@@ -691,6 +830,7 @@ class ComicAdv:
         total_author: int,
         idf_power: float,
         author_weight: float,
+        all_tags: Iterable[str] = (),
     ) -> float:
         tag_score = sum(
             self._tag_weight(t)
@@ -702,7 +842,88 @@ class ComicAdv:
             * self._idf(self.fav_author.get(a, 0), total_author, 1.0)
             for a in hit_authors if a in self.fav_author
         )
-        return tag_score + author_weight * author_score
+        base = tag_score + author_weight * author_score
+        if self.blacklist_tags:
+            tag_set = all_tags if isinstance(all_tags, (set, frozenset)) else set(all_tags)
+            bl_hit = tag_set & self.blacklist_tags
+            if bl_hit:
+                base -= len(bl_hit) * self.config.search.blacklist_penalty
+        return base
+
+    # ---------- enrich ----------
+    def _enrich_candidates(self, candidates: list[dict]) -> None:
+        to_fetch = [c["id"] for c in candidates if not c.get("all_tags")]
+        if not to_fetch:
+            return
+
+        log.info("🔎 enrich %d 个候选的 tags（用于黑名单降权）...", len(to_fetch))
+        by_id = {c["id"]: c for c in candidates}
+
+        def _fetch(aid: str):
+            try:
+                tags, authors, _title = self._fetch_meta_safe(aid)
+                return aid, tags, authors
+            except Exception:
+                log.debug("enrich %s failed", aid, exc_info=True)
+                return aid, None, None
+
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            for aid, tags, authors in pool.map(_fetch, to_fetch):
+                if tags is None:
+                    continue
+                cand = by_id.get(aid)
+                if not cand:
+                    continue
+                cand["all_tags"] = tags
+                if authors:
+                    for a in authors:
+                        if a in self.fav_author:
+                            cand["hit_authors"].add(a)
+
+        log.info("✅ enrich 完成")
+
+    # ---------- 共享的排名流程 ----------
+    def _rank_candidates(
+        self,
+        candidates: dict[str, dict],
+        total_tag: int,
+        total_author: int,
+        top_n: int,
+        idf_power: float,
+        author_weight: float,
+    ) -> list[dict]:
+        cfg = self.config.search
+        for c in candidates.values():
+            c["_pre_score"] = self._score_hits(
+                c["hit_tags"], c["hit_authors"],
+                total_tag, total_author, idf_power, author_weight,
+            )
+
+        if cfg.enrich_candidates and self.blacklist_tags and candidates:
+            pre_sorted = sorted(
+                candidates.values(), key=lambda c: c["_pre_score"], reverse=True
+            )
+            enrich_target = pre_sorted[: top_n + cfg.enrich_extra]
+            self._enrich_candidates(enrich_target)
+
+        for c in candidates.values():
+            c["_score"] = self._score_hits(
+                c["hit_tags"], c["hit_authors"],
+                total_tag, total_author, idf_power, author_weight,
+                all_tags=c.get("all_tags", []),
+            )
+            c["hit_tags"] = sorted(c["hit_tags"])
+            c["hit_authors"] = sorted(c["hit_authors"])
+            c["blacklist_hit"] = sorted(
+                set(c.get("all_tags", [])) & self.blacklist_tags
+            )
+            c.pop("_pre_score", None)
+
+        # 已收藏的沉底，避免挤占 top_n
+        return sorted(
+            candidates.values(),
+            key=lambda c: (bool(c.get("added")), -c["_score"]),
+        )[:top_n]
 
     # ---------- ranked ----------
     def ad_ranked(
@@ -733,32 +954,19 @@ class ComicAdv:
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             for tag, comics in pool.map(_fetch, [t for t, _ in eff_tags]):
                 for c in comics:
-                    cand = candidates.setdefault(
-                        c["id"],
-                        {
-                            "id": c["id"], "title": c["title"], "added": c["added"],
-                            "hit_tags": set(), "hit_authors": set(),
-                        },
-                    )
+                    cand = candidates.setdefault(c["id"], {
+                        "id": c["id"], "title": c["title"], "added": c["added"],
+                        "hit_tags": set(), "hit_authors": set(),
+                        "all_tags": [],
+                    })
                     cand["hit_tags"].add(tag)
-                    # 回填作者维度：搜索结果自带作者时命中收藏作者也计入，
-                    # 使纯 tag 模式下 author_weight 真正参与打分
                     for _a in c.get("authors", []):
                         if _a in self.fav_author:
                             cand["hit_authors"].add(_a)
 
-        def _score(c: dict) -> float:
-            return self._score_hits(
-                c["hit_tags"], c["hit_authors"],
-                total_tag, total_author, idf_power, cfg.author_weight,
-            )
-
-        ranked = sorted(candidates.values(), key=_score, reverse=True)[:top_n]
-        for c in ranked:
-            c["_score"] = _score(c)
-            c["hit_tags"] = sorted(c["hit_tags"])
-            c["hit_authors"] = sorted(c["hit_authors"])
-
+        ranked = self._rank_candidates(
+            candidates, total_tag, total_author, top_n, idf_power, cfg.author_weight
+        )
         if not ranked:
             return {}
         log.info("✅ [ranked tag] 候选 %d，Top %d", len(candidates), len(ranked))
@@ -793,29 +1001,16 @@ class ComicAdv:
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             for author, comics in pool.map(_fetch, authors):
                 for c in comics:
-                    cand = candidates.setdefault(
-                        c["id"],
-                        {
-                            "id": c["id"], "title": c["title"], "added": c["added"],
-                            "hit_tags": set(), "hit_authors": set(),
-                        },
-                    )
+                    cand = candidates.setdefault(c["id"], {
+                        "id": c["id"], "title": c["title"], "added": c["added"],
+                        "hit_tags": set(), "hit_authors": set(),
+                        "all_tags": [],
+                    })
                     cand["hit_authors"].add(author)
-                    # 搜索结果不携带 tag，无法低成本回填 hit_tags，
-                    # 故作者维度打分以 hit_authors 为准
 
-        def _score(c: dict) -> float:
-            return self._score_hits(
-                c["hit_tags"], c["hit_authors"],
-                total_tag, total_author, cfg.idf_power, cfg.author_weight,
-            )
-
-        ranked = sorted(candidates.values(), key=_score, reverse=True)[:top_n]
-        for c in ranked:
-            c["_score"] = _score(c)
-            c["hit_tags"] = sorted(c["hit_tags"])
-            c["hit_authors"] = sorted(c["hit_authors"])
-
+        ranked = self._rank_candidates(
+            candidates, total_tag, total_author, top_n, cfg.idf_power, cfg.author_weight
+        )
         if not ranked:
             return {}
         log.info("✅ [ranked author] 候选 %d，Top %d", len(candidates), len(ranked))
@@ -879,14 +1074,14 @@ class ComicAdv:
                 results[f"author:{author} | {' + '.join(combo)}"] = comics
         return results
 
-    # ---------- 黑名单本地兜底 ----------
-    def _filter_blacklisted_with_meta(
+    # ---------- 黑名单检查（软警告） ----------
+    def _check_blacklist_meta(
         self, ids: list[str]
     ) -> tuple[list[str], dict[str, tuple[list[str], list[str], str]]]:
-        if not self.blacklist_tags:
+        if not ids or not self.blacklist_tags:
             return ids, {}
 
-        meta_cache: dict[str, tuple] = {}
+        meta_cache: dict[str, tuple[list[str], list[str], str]] = {}
         meta_lock = threading.Lock()
 
         def _check(aid: str):
@@ -902,13 +1097,14 @@ class ComicAdv:
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             results = list(pool.map(_check, ids))
 
-        kept: list[str] = []
         for aid, bad in results:
             if bad:
-                log.warning("🚫 %s 命中黑名单 %s，已跳过", aid, sorted(bad))
-            else:
-                kept.append(aid)
-        return kept, meta_cache
+                log.warning(
+                    "⚠️ %s 命中黑名单 %s（尊重用户选择，仍添加）",
+                    aid, sorted(bad),
+                )
+
+        return ids, meta_cache
 
     # ---------- 收集 ----------
     def _collect_grouped(
@@ -936,13 +1132,39 @@ class ComicAdv:
                 grouped.append((combo, uniq))
         return grouped
 
+    # ---------- 前端视图 ----------
+    def build_view(self, results: dict[str, list[dict]]) -> list[dict]:
+        grouped = self._collect_grouped(results)
+        out: list[dict] = []
+        for combo, uniq in grouped:
+            items = []
+            for i, it in enumerate(uniq, 1):
+                all_tags = list(it.get("all_tags", []))
+                bl_hit = (
+                    sorted(set(all_tags) & self.blacklist_tags)
+                    if all_tags else list(it.get("blacklist_hit", []))
+                )
+                items.append({
+                    "idx": i,
+                    "id": it["id"],
+                    "title": it["title"],
+                    "added": bool(it.get("added")),
+                    "hit_tags": list(it.get("hit_tags", [])),
+                    "all_tags": all_tags,
+                    "blacklist_hit": bl_hit,
+                    "score": it.get("_score"),
+                })
+            out.append({"combo": combo, "items": items})
+        return out
+
     # ---------- 导出 ----------
     def _default_export_path(self, fmt: str, label: str = "") -> Path:
         ext = "html" if fmt in ("html", "htm") else "md"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 毫秒精度
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         name = f"results_{ts}"
         if label:
-            name += f"_{label}"
+            safe = re.sub(r'[\\/:*?"<>|]', "_", label)
+            name += f"_{safe}"
         return self.base_dir / f"{name}.{ext}"
 
     def _to_markdown(
@@ -952,7 +1174,10 @@ class ComicAdv:
         lines.append(f"> 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
         if self.blacklist_tags:
-            lines.append(f"> 黑名单：{', '.join(sorted(self.blacklist_tags))}")
+            lines.append(
+                f"> 黑名单（软惩罚 × {self.config.search.blacklist_penalty}）："
+                f"{', '.join(sorted(self.blacklist_tags))}"
+            )
             lines.append("")
         if not grouped:
             lines.append("_未搜索到任何结果_")
@@ -962,16 +1187,21 @@ class ComicAdv:
         for combo, items in grouped:
             lines.append(f"## {combo} ({len(items)} 条)")
             lines.append("")
-            lines.append("| # | ID | 标题 | 状态 | 命中 | 分数 |")
-            lines.append("|---:|----|------|------|------|-----:|")
+            lines.append("| # | ID | 标题 | 状态 | 命中 | 黑名单 | 分数 |")
+            lines.append("|---:|----|------|------|------|--------|-----:|")
             for idx, item in enumerate(items, 1):
                 status = "已收藏" if item.get("added") else "新"
                 t = _md_escape(item["title"])
                 hit = _md_escape(", ".join(item.get("hit_tags", [])))
+                bl = _md_escape(", ".join(item.get("blacklist_hit", [])))
                 score = item.get("_score")
-                score_s = f"{score:.2f}" if isinstance(score, float) else ""
+                score_s = (
+                    f"{score:.2f}"
+                    if isinstance(score, (int, float)) and not isinstance(score, bool)
+                    else ""
+                )
                 lines.append(
-                    f"| {idx} | {item['id']} | {t} | {status} | {hit} | {score_s} |"
+                    f"| {idx} | {item['id']} | {t} | {status} | {hit} | {bl} | {score_s} |"
                 )
             lines.append("")
             total += len(items)
@@ -992,6 +1222,7 @@ class ComicAdv:
             "tr:nth-child(even){background:#fafafa;}",
             ".added{color:#999;}",
             ".hit{color:#666;font-size:.9em;}",
+            ".bl{color:#c0392b;font-size:.9em;}",
             ".score{color:#0a7;font-variant-numeric:tabular-nums;}",
             "h1{margin-top:0;}",
             "</style>", "</head>", "<body>",
@@ -1000,7 +1231,8 @@ class ComicAdv:
         ]
         if self.blacklist_tags:
             parts.append(
-                f'<p>黑名单：{esc(", ".join(sorted(self.blacklist_tags)))}</p>'
+                f'<p>黑名单（软惩罚 × {self.config.search.blacklist_penalty}）：'
+                f'{esc(", ".join(sorted(self.blacklist_tags)))}</p>'
             )
         if not grouped:
             parts.append("<p><em>未搜索到任何结果</em></p>")
@@ -1011,7 +1243,7 @@ class ComicAdv:
                 parts.append(
                     "<table><thead><tr>"
                     "<th>#</th><th>ID</th><th>标题</th><th>状态</th>"
-                    "<th>命中</th><th>分数</th>"
+                    "<th>命中</th><th>黑名单</th><th>分数</th>"
                     "</tr></thead><tbody>"
                 )
                 for idx, item in enumerate(items, 1):
@@ -1020,14 +1252,20 @@ class ComicAdv:
                         if item.get("added") else "新"
                     )
                     hit = ", ".join(item.get("hit_tags", []))
+                    bl = ", ".join(item.get("blacklist_hit", []))
                     score = item.get("_score")
-                    score_s = f"{score:.2f}" if isinstance(score, float) else ""
+                    score_s = (
+                        f"{score:.2f}"
+                        if isinstance(score, (int, float)) and not isinstance(score, bool)
+                        else ""
+                    )
                     parts.append(
                         f"<tr><td>{idx}</td>"
                         f"<td>{esc(item['id'])}</td>"
                         f"<td>{esc(item['title'])}</td>"
                         f"<td>{status}</td>"
                         f'<td class="hit">{esc(hit)}</td>'
+                        f'<td class="bl">{esc(bl)}</td>'
                         f'<td class="score">{esc(score_s)}</td></tr>'
                     )
                 parts.append("</tbody></table>")
@@ -1044,9 +1282,11 @@ class ComicAdv:
         path: Path | None = None,
         title: str = "ComicAdv 搜索结果",
         label: str = "",
+        grouped: list[tuple[str, list[dict]]] | None = None,
     ) -> Path:
         fmt = fmt.lower().lstrip(".")
-        grouped = self._collect_grouped(results)
+        if grouped is None:
+            grouped = self._collect_grouped(results)
         if fmt in ("md", "markdown"):
             content = self._to_markdown(grouped, title)
         elif fmt in ("html", "htm"):
@@ -1070,11 +1310,15 @@ class ComicAdv:
         export_path: Path | None = None,
         export_label: str = "",
     ) -> Path | None:
+        # 提前算好 grouped，导出时复用，避免重复计算
+        grouped = self._collect_grouped(results) if results else []
+
         def _do_export() -> Path | None:
             if not export_format:
                 return None
             p = self.export_results(
-                results, fmt=export_format, path=export_path, label=export_label,
+                results, fmt=export_format, path=export_path,
+                label=export_label, grouped=grouped,
             )
             console.print(f"[green]已导出 {export_format.upper()}:[/] {p}")
             return p
@@ -1086,12 +1330,13 @@ class ComicAdv:
             )
             return _do_export()
 
-        grouped = self._collect_grouped(results)
         if not grouped:
             console.print("[yellow]搜索结果均已收藏或已过滤，无新条目[/]")
             return _do_export()
 
+        # 全局连续编号，避免多组时用户序号错位
         all_candidates: list[dict] = []
+        global_idx = 0
         for combo, uniq in grouped:
             table = Table(title=f"📚 {combo} ({len(uniq)} 条结果)", show_lines=True)
             table.add_column("#", style="dim", width=4)
@@ -1100,34 +1345,38 @@ class ComicAdv:
             table.add_column("分数", style="green", width=7, justify="right")
 
             show_items = uniq[:max_show]
-            for idx, item in enumerate(show_items, 1):
+            for item in show_items:
+                global_idx += 1
                 title_text = item["title"]
                 if item.get("added"):
                     title_text += " [dim](已收藏)[/dim]"
                 if item.get("hit_tags"):
                     preview = ", ".join(item["hit_tags"][:3])
                     title_text += f" [dim](命中: {preview})[/dim]"
+                bl_hit = item.get("blacklist_hit") or []
+                if bl_hit:
+                    title_text += f" [red](黑名单: {', '.join(bl_hit[:2])})[/red]"
                 score = item.get("_score")
                 score_s = f"{score:.2f}" if isinstance(score, float) else ""
-                table.add_row(str(idx), item["id"], title_text, score_s)
+                table.add_row(str(global_idx), item["id"], title_text, score_s)
                 all_candidates.append(item)
 
             if len(uniq) > max_show:
-                table.add_row("...", f"+{len(uniq) - max_show}", "更多结果未显示", "")
+                table.add_row(
+                    "...", f"+{len(uniq) - max_show}",
+                    f"更多结果未显示（仅前 {max_show} 条可选）", "",
+                )
             console.print(table)
 
         if not all_candidates:
             return _do_export()
 
         choice = Prompt.ask(
-            "\n输入序号添加到收藏（逗号分隔，如 1,3,5-8），直接回车跳过",
+            "\n输入全局序号添加到收藏（逗号/空格分隔，如 1,3,5-8），直接回车跳过",
             default="",
         )
         selected_ids = self._parse_selection(choice, len(all_candidates))
 
-        # 反馈记录：
-        # - 选中 → selected_tags
-        # - 未选且非已收藏 → skipped_tags（已收藏且未选不算用户负反馈）
         if self.config.feedback.enabled:
             selected_set = set(selected_ids)
             with self._lock:
@@ -1143,6 +1392,7 @@ class ComicAdv:
                         continue
                     for tag in tags:
                         target[tag] += 1
+            self._invalidate_eff_tags()
             log.info(
                 "📝 反馈记录：选中 %d 条，跳过 %d 条（已收藏不记 skipped）",
                 len(selected_ids),
@@ -1152,19 +1402,10 @@ class ComicAdv:
 
         if selected_ids:
             ids = [all_candidates[i]["id"] for i in selected_ids]
-            if self.blacklist_tags:
-                console.print(f"[green]已选择 {len(ids)} 条，正在检查黑名单...[/]")
-                kept, meta = self._filter_blacklisted_with_meta(ids)
-                if len(kept) < len(ids):
-                    console.print(
-                        f"[yellow]🚫 黑名单过滤掉 {len(ids) - len(kept)} 条[/]"
-                    )
-            else:
-                kept, meta = ids, {}
-            if kept:
-                console.print(f"[green]开始添加 {len(kept)} 条...[/]")
-                self.add(kept, preset_meta=meta)
-                self.save()
+            kept, meta = self._check_blacklist_meta(ids)
+            console.print(f"[green]开始添加 {len(kept)} 条...[/]")
+            self.add(kept, preset_meta=meta)
+            self.save()
 
         return _do_export()
 
@@ -1173,55 +1414,97 @@ class ComicAdv:
         if not raw.strip():
             return []
         indices: set[int] = set()
-        for part in raw.split(","):
-            part = part.strip()
+        # 支持中文逗号、英文逗号、空白分隔
+        for part in re.split(r"[,，\s]+", raw.strip()):
+            if not part:
+                continue
             if "-" in part:
                 try:
                     start, end = part.split("-", 1)
-                    for i in range(int(start), int(end) + 1):
+                    a, b = int(start), int(end)
+                    if a > b:
+                        a, b = b, a
+                    for i in range(a, b + 1):
                         if 1 <= i <= max_idx:
                             indices.add(i - 1)
+                        else:
+                            log.warning("⚠️ 序号越界: %d（有效 1-%d）", i, max_idx)
                 except ValueError:
-                    pass
+                    log.warning("⚠️ 无法解析选择: %r", part)
             else:
                 try:
                     i = int(part)
                     if 1 <= i <= max_idx:
                         indices.add(i - 1)
+                    else:
+                        log.warning("⚠️ 序号越界: %d（有效 1-%d）", i, max_idx)
                 except ValueError:
-                    pass
+                    log.warning("⚠️ 无法解析选择: %r", part)
         return sorted(indices)
 
 
 # ==================== CLI ====================
-def setup_logging():
+def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        force=True,  # 允许重复调用（测试 / notebook）
     )
 
 
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ComicAdv",
+        description="基于 jmcomic 的偏好推荐 / 搜索工具",
+    )
+    p.add_argument("--add", nargs="*", default=[],
+                   help="直接抓取并加入收藏的 album id 列表")
+    p.add_argument("--user", default=os.getenv("JM_USER", ""),
+                   help="登录用户名（默认读环境变量 JM_USER）")
+    p.add_argument("--password", default=os.getenv("JM_PASSWORD", ""),
+                   help="登录密码（默认读环境变量 JM_PASSWORD）")
+    p.add_argument("--mode", choices=["ranked", "progressive"], default=None,
+                   help="覆盖 config.toml 中的 search.mode")
+    p.add_argument("--no-login", action="store_true",
+                   help="跳过登录（使用匿名 / cookies 模式）")
+    p.add_argument("--no-search", action="store_true",
+                   help="只做 --add 抓取，不执行推荐搜索")
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
     setup_logging()
+    args = _build_arg_parser().parse_args(argv)
 
     cfg = _load_config(BASE_DIR / "config.toml")
     cad = ComicAdv(config=cfg)
     cad.load()
 
-    # ---------- 登录（强烈建议启用） ----------
-    # cad.login(username="...", password="...")
-    # 或 cookies 写 option.yml 的 postman.meta_data.cookies
-    # 或 login 插件（option.yml 里配 plugins.after_init.login）
+    # ---------- 登录 ----------
+    if not args.no_login:
+        if args.user and args.password:
+            if not cad.login(args.user, args.password):
+                console.print("[red]登录失败，将以匿名状态继续[/red]")
+        elif args.user or args.password:
+            log.warning("⚠️ 只提供了用户名或密码之一，跳过登录")
+        else:
+            log.debug("未提供登录凭据，使用匿名 / cookies 模式")
 
-    new_ids = []
-    if new_ids:
-        cad.add(new_ids)
+    # ---------- 批量添加 ----------
+    if args.add:
+        cad.add(args.add)
         cad.save()
 
+    if args.no_search:
+        return
+
     if cad.blacklist_tags:
-        console.print(f"[bold]🚫 黑名单:[/] {sorted(cad.blacklist_tags)}")
+        console.print(
+            f"[bold]🚫 黑名单（软惩罚 × {cfg.search.blacklist_penalty}）:[/] "
+            f"{sorted(cad.blacklist_tags)}"
+        )
     if cad.language_tags:
         console.print(
             f"[bold]🌐 已忽略语言标签:[/] {sorted(cad.language_tags)[:6]}…"
@@ -1230,32 +1513,35 @@ def main():
     console.print("[bold]✍️ Top Authors:[/]", cad.fav_author.most_common(10))
 
     s = cfg.search
+    mode = args.mode or s.mode
     export_fmt = cfg.export.format or None
 
-    if s.mode == "ranked":
+    if mode == "ranked":
         def _tag():
             return cad.ad_ranked()
+
         def _author():
             return cad.ad_author_ranked()
     else:
         def _tag():
             return cad.ad(max_pages=s.max_pages)
+
         def _author():
             return cad.ad_author(max_pages=s.max_pages)
 
     if cad._effective_fav_tags():
-        console.rule(f"[bold blue]按 Tag 搜索（{s.mode}）")
+        console.rule(f"[bold blue]按 Tag 搜索（{mode}）")
         cad.display_results(
             _tag(), export_format=export_fmt, export_label="tag",
         )
 
     if cad.fav_author:
-        console.rule(f"[bold magenta]按作者搜索（{s.mode}）")
+        console.rule(f"[bold magenta]按作者搜索（{mode}）")
         cad.display_results(
             _author(), export_format=export_fmt, export_label="author",
         )
 
-    if s.mode == "progressive" and cad.fav_author and cad._effective_fav_tags():
+    if mode == "progressive" and cad.fav_author and cad._effective_fav_tags():
         console.rule("[bold yellow]作者限定 + Tag 渐进")
         cad.display_results(
             cad.ad_author_tag(top_authors=3, max_pages=s.max_pages),
